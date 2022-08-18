@@ -19,6 +19,8 @@ import logging
 from threading import Thread, Lock
 from abc import ABC, abstractmethod
 
+from clamour import Clamour, PoseMessage, CustomOdometry
+
 from cognifly.utils.udp_interface import UDPInterface
 from cognifly.utils.tcp_video_interface import TCPVideoInterface
 from cognifly.utils.ip_tools import extract_ip
@@ -307,6 +309,79 @@ class PoseEstimator(ABC):
         """
         raise NotImplementedError
 
+class ClamourPoseEstimator(PoseEstimator):
+    def __init__(self):
+        self.last_x = 0
+        self.current_x = 0
+        self.velocity_x = 0
+
+        self.last_y = 0
+        self.current_y = 0
+        self.velocity_x = 0
+
+        self.last_z = 0
+        self.current_z = 0
+        self.velocity_x = 0
+
+        self.last_yaw = 0
+        self.current_yaw = 0
+        self.velocity_x = 0
+
+        self.fcOdometry = CustomOdometry(
+            [[20,  0,  0,   0],
+             [ 0, 20,  0,   0],
+             [ 0,  0, 20,   0],
+             [ 0,  0,  0, 0.5]]
+        )
+        self.clamour = Clamour([self.fcOdometry])
+        self.clamour.start_non_blocking(False, self._on_new_pose)
+
+    def get(self, x, y, z, dx, dy, dz, yaw, dyaw):
+        _updateFlightControllerOdometry
+        return self._get_last_calculated_output()
+    
+    def _updateFlightControllerOdometry(x, y, z, yaw):
+        self.fcOdometry.update_pose(PoseMessage(x, y, z, yaw))
+
+    def _get_last_calculated_output():
+        return (
+            self.current_x,
+            self.current_y,
+            self.current_z,
+            self.current_yaw,
+            self.velocity_x,
+            self.velocity_y,
+            self.velocity_z,
+            self.velocity_yaw
+        )
+
+    def _on_new_pose(self, pose: PoseMessage):
+        self.current_x = pose.x
+        self.velocity_x = self.current_x - self.last_x
+        self.last_x = self.current_x
+
+        self.current_y = pose.y
+        self.velocity_y = self.current_y - self.last_y
+        self.last_y = self.current_y
+
+        self.current_z = pose.z
+        self.velocity_z = self.current_z - self.last_z
+        self.last_z = self.current_z
+
+        self.current_yaw = pose.yaw
+        self.velocity_yaw = self.current_yaw - self.last_yaw
+        self.last_yaw = self.current_yaw
+
+        print(
+            self.current_x,
+            self.current_y,
+            self.current_z,
+            self.current_yaw,
+            self.velocity_x,
+            self.velocity_y,
+            self.velocity_z,
+            self.velocity_yaw
+        )
 
 class CogniflyController:
     def __init__(self,
@@ -659,8 +734,26 @@ class CogniflyController:
         # retrieve the current state
         failure_custom = False
         recovery = False
+
+        board.fast_read_attitude()
+        fc_yaw = board.SENSOR_DATA['kinematics'][2] * np.pi / 180.0
+        board.send_RAW_msg(MSPy.MSPCodes['MSP_DEBUG'])  # MSP2_INAV_DEBUG is too long to answer
+        data_handler = board.receive_msg()
+        board.process_recv_data(data_handler)
+
+        fc_pos_x_wf = board.SENSOR_DATA['debug'][0] / 1e4
+        fc_pos_y_wf = board.SENSOR_DATA['debug'][1] / 1e4
+        fc_vel_x_wf = board.SENSOR_DATA['debug'][2] / 1e4
+        fc_vel_y_wf = board.SENSOR_DATA['debug'][3] / 1e4
+        fc_board.fast_read_altitude()
+        fc_pos_z_wf = board.SENSOR_DATA['altitude']
+        fc_yaw_rate = self._compute_yaw_rate(yaw)
+        fc_vel_z_wf = self._compute_z_vel(pos_z_wf)
+
         if self.pose_estimator is not None:  # TODO: test this part of the code (including recovery)
-            pos_x_wf, pos_y_wf, pos_z_wf, yaw, vel_x_wf, vel_y_wf, vel_z_wf, yaw_rate = self.pose_estimator.get()
+            pos_x_wf, pos_y_wf, pos_z_wf, yaw, vel_x_wf, vel_y_wf, vel_z_wf, yaw_rate = self.pose_estimator.get(
+                fc_pos_x_wf, fc_pos_y_wf, fc_pos_z_wf, fc_yaw, fc_vel_x_wf, fc_vel_y_wf, fc_vel_z_wf, fc_yaw_rate
+            )
             if None in (pos_x_wf, pos_y_wf, pos_z_wf, yaw, vel_x_wf, vel_y_wf, vel_z_wf, yaw_rate):
                 failure_custom = True
             if failure_custom and self.valid_custom_estimate:
@@ -676,19 +769,14 @@ class CogniflyController:
                     screen.addstr(28, 0, f"Custom estimate: valid")
                     screen.clrtoeol()
         if self.pose_estimator is None or failure_custom:
-            board.fast_read_attitude()
-            yaw = board.SENSOR_DATA['kinematics'][2] * np.pi / 180.0
-            board.send_RAW_msg(MSPy.MSPCodes['MSP_DEBUG'])  # MSP2_INAV_DEBUG is too long to answer
-            data_handler = board.receive_msg()
-            board.process_recv_data(data_handler)
-            pos_x_wf = board.SENSOR_DATA['debug'][0] / 1e4
-            pos_y_wf = board.SENSOR_DATA['debug'][1] / 1e4
-            vel_x_wf = board.SENSOR_DATA['debug'][2] / 1e4
-            vel_y_wf = board.SENSOR_DATA['debug'][3] / 1e4
-            board.fast_read_altitude()
-            pos_z_wf = board.SENSOR_DATA['altitude']
-            yaw_rate = self._compute_yaw_rate(yaw)
-            vel_z_wf = self._compute_z_vel(pos_z_wf)
+            pos_x_wf = fc_pos_x_wf
+            pos_y_wf = fc_pos_y_wf
+            pos_z_wf = fc_pos_z_wf
+            vel_x_wf = fc_vel_x_wf
+            vel_y_wf = fc_vel_y_wf
+            vel_z_wf = fc_vel_z_wf
+            yaw = fc_yaw
+            yaw_rate = fc_yaw_rate
 
         old_pos_x_wf = pos_x_wf
         old_pos_y_wf = pos_y_wf
@@ -1272,7 +1360,11 @@ class CogniflyController:
 
 
 def run_controller(print_screen=True):
-    cc = CogniflyController(print_screen=print_screen)
+    clamourPoseEstimator = ClamourPoseEstimator()
+    cc = CogniflyController(
+        print_screen=print_screen,
+        pose_estimator=clamourPoseEstimator
+    )
     cc.run_curses()
 
 
